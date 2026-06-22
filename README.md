@@ -16,6 +16,7 @@ I havent tested on linux yet but i have tested on windows so if anyone wants to 
 ### Dependencies
 - Tesseract-OCR
 - MKVToolNix
+- Python dependencies: pytesseract, Pyside6, Fluentwidgets (pip install PySide6 "PyQt-Fluent-Widgets[full]" pytesseract) 
 
 
 FYI: This tool is vibe coded.
