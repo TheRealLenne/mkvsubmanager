@@ -14,6 +14,7 @@ from qfluentwidgets import (
     ProgressBar, IndeterminateProgressBar, Pivot, ComboBox, LineEdit, SpinBox,
     FluentIcon as FIF
 )
+import uuid
 
 # ---------- persistent config (saved to AppData) ----------
 
@@ -226,7 +227,7 @@ def extract_subtitle_track(mkv_path: str, track: dict, out_dir: Path, base_name:
 
     raw_ext, conversion = CODEC_MAP.get(codec_id, ("srt", None))
 
-    raw_path = out_dir / f"_raw_{tid}.{raw_ext}"
+    raw_path = out_dir / f"_raw_{uuid.uuid4().hex}_{tid}.{raw_ext}"
     subprocess.run([CONFIG["mkvextract_path"], mkv_path, "tracks", f"{tid}:{raw_path}"],
                     check=True, capture_output=True, text=True)
 
