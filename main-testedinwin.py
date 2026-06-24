@@ -1,5 +1,7 @@
 import sys, os, re, json, subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QHeaderView,
     QAbstractItemView, QFileDialog, QTableWidgetItem, QStackedWidget,
@@ -9,20 +11,58 @@ from PySide6.QtCore import Qt, QThread, Signal
 from qfluentwidgets import (
     TableWidget, PrimaryPushButton, PushButton, BodyLabel, TitleLabel,
     InfoBar, InfoBarPosition, MessageBox, setTheme, Theme,
-    ProgressBar, IndeterminateProgressBar, Pivot
+    ProgressBar, IndeterminateProgressBar, Pivot, ComboBox, LineEdit, SpinBox,
+    FluentIcon as FIF
 )
 
-MKVMERGE = r"C:\Program Files\MKVToolNix\mkvmerge.exe" # Change this to the mkvmerge.exe file path
-MKVEXTRACT = r"C:\Program Files\MKVToolNix\mkvextract.exe" # Change this to the mkvextract.exe file path
-TESSERACT_DIR = r"C:\Users\User\AppData\Local\Programs\Tesseract-OCR" # Change this path to Tesseract OCR Directory
+# ---------- persistent config (saved to AppData) ----------
 
-os.environ["PATH"] = TESSERACT_DIR + os.pathsep + os.environ.get("PATH", "")
+APPDATA_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "MKVSubtitleManager"
+APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = APPDATA_DIR / "config.json"
 
-try:
-    import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = str(Path(TESSERACT_DIR) / "tesseract.exe")
-except ImportError:
-    pass
+DEFAULT_CONFIG = {
+    "theme": "auto",  # light, dark, auto
+    "mkvmerge_path": r"C:\Program Files\MKVToolNix\mkvmerge.exe",
+    "mkvextract_path": r"C:\Program Files\MKVToolNix\mkvextract.exe",
+    "tesseract_dir": r"C:\Program Files\Tesseract-OCR",
+    "max_workers": 4,
+}
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            cfg = DEFAULT_CONFIG.copy()
+            cfg.update(data)
+            return cfg
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+
+def save_config(cfg: dict):
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+CONFIG = load_config()
+
+
+def apply_tesseract_path():
+    tdir = CONFIG.get("tesseract_dir", "")
+    if tdir:
+        os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
+        try:
+            import pytesseract
+            exe = Path(tdir) / "tesseract.exe"
+            if exe.exists():
+                pytesseract.pytesseract.tesseract_cmd = str(exe)
+        except ImportError:
+            pass
+
+
+apply_tesseract_path()
 
 try:
     from pgsrip import Sup, Options, pgsrip
@@ -31,8 +71,26 @@ try:
 except ImportError:
     PGSRIP_AVAILABLE = False
 
+
+def apply_theme(name: str):
+    mapping = {"light": Theme.LIGHT, "dark": Theme.DARK, "auto": Theme.AUTO}
+    setTheme(mapping.get(name, Theme.AUTO))
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ASS_TAG_RE = re.compile(r"\{.*?\}")
+
+# codec_id -> (raw_extension, conversion_kind)
+# conversion_kind: None = keep as-is, "ass" = ASS/SSA->SRT, "vtt" = WebVTT->SRT, "pgs" = OCR->SRT
+CODEC_MAP = {
+    "S_TEXT/ASS": ("ass", "ass"),
+    "S_TEXT/SSA": ("ssa", "ass"),
+    "S_TEXT/UTF8": ("srt", None),
+    "S_TEXT/WEBVTT": ("vtt", "vtt"),
+    "S_HDMV/PGS": ("sup", "pgs"),
+    "S_VOBSUB": ("idx", None),
+    "S_DVBSUB": ("sub", None),
+}
 
 
 # ---------- shared helpers ----------
@@ -81,7 +139,7 @@ def ass_to_srt(ass_path: Path, srt_path: Path):
             parts = rest.split(",", len(fmt_fields) - 1)
             events.append(dict(zip(fmt_fields, parts)))
 
-    srt_blocks, n = [], 0
+    blocks, n = [], 0
     for ev in events:
         start = ass_time_to_srt(ev["Start"].strip())
         end = ass_time_to_srt(ev["End"].strip())
@@ -90,9 +148,39 @@ def ass_to_srt(ass_path: Path, srt_path: Path):
         if not clean:
             continue
         n += 1
-        srt_blocks.append(f"{n}\n{start} --> {end}\n{clean}\n")
+        blocks.append(f"{n}\n{start} --> {end}\n{clean}\n")
 
-    srt_path.write_text("\n".join(srt_blocks), encoding="utf-8")
+    srt_path.write_text("\n".join(blocks), encoding="utf-8")
+
+
+def vtt_to_srt(vtt_path: Path, srt_path: Path):
+    """Basic WebVTT -> SRT conversion (timestamps + cue text, strips cue settings)."""
+    lines = vtt_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    blocks, n = [], 0
+    timing, cue_lines = None, []
+
+    def flush():
+        nonlocal n
+        if timing and cue_lines:
+            text_block = "\n".join(cue_lines).strip()
+            if text_block:
+                n += 1
+                blocks.append(f"{n}\n{timing}\n{text_block}\n")
+
+    for line in lines:
+        if "-->" in line:
+            flush()
+            cue_lines = []
+            start_raw, end_raw = line.split("-->")
+            start = start_raw.strip().split(" ")[0].replace(".", ",")
+            end = end_raw.strip().split(" ")[0].replace(".", ",")
+            timing = f"{start} --> {end}"
+        elif line.strip() == "" or line.strip().upper() == "WEBVTT":
+            continue
+        else:
+            cue_lines.append(line)
+    flush()
+    srt_path.write_text("\n".join(blocks), encoding="utf-8")
 
 
 def resolve_language(lang_code: str):
@@ -119,13 +207,15 @@ def pgs_to_srt(sup_path: Path, srt_path: Path, lang_code: str):
 
 
 def get_subtitle_tracks(mkv_path: str) -> list:
-    out = subprocess.run([MKVMERGE, "-J", mkv_path], capture_output=True, text=True, check=True)
+    out = subprocess.run([CONFIG["mkvmerge_path"], "-J", mkv_path],
+                          capture_output=True, text=True, check=True)
     data = json.loads(out.stdout)
     return [t for t in data.get("tracks", []) if t["type"] == "subtitles"]
 
 
 def remux_without_subtitles(mkv_path: str, out_path: Path):
-    subprocess.run([MKVMERGE, "-o", str(out_path), "-S", mkv_path], check=True, capture_output=True, text=True)
+    subprocess.run([CONFIG["mkvmerge_path"], "-o", str(out_path), "-S", mkv_path],
+                    check=True, capture_output=True, text=True)
 
 
 def extract_subtitle_track(mkv_path: str, track: dict, out_dir: Path, base_name: str, used_names: set) -> Path:
@@ -134,25 +224,26 @@ def extract_subtitle_track(mkv_path: str, track: dict, out_dir: Path, base_name:
     lang = props.get("language", "und")
     tid = track["id"]
 
-    if codec_id in ("S_TEXT/ASS", "S_TEXT/SSA"):
-        raw_ext, conversion = ("ass" if codec_id == "S_TEXT/ASS" else "ssa"), "ass"
-    elif codec_id == "S_TEXT/UTF8":
-        raw_ext, conversion = "srt", None
-    elif codec_id == "S_HDMV/PGS":
-        raw_ext, conversion = "sup", "pgs"
-    elif codec_id == "S_VOBSUB":
-        raw_ext, conversion = "idx", None
-    else:
-        raw_ext, conversion = "srt", None
+    raw_ext, conversion = CODEC_MAP.get(codec_id, ("srt", None))
 
     raw_path = out_dir / f"_raw_{tid}.{raw_ext}"
-    subprocess.run([MKVEXTRACT, mkv_path, "tracks", f"{tid}:{raw_path}"],
+    subprocess.run([CONFIG["mkvextract_path"], mkv_path, "tracks", f"{tid}:{raw_path}"],
                     check=True, capture_output=True, text=True)
 
     if conversion == "ass":
         final_path = unique_path(out_dir / dedup_name(base_name, lang, "srt", tid, used_names))
         ass_to_srt(raw_path, final_path)
         raw_path.unlink(missing_ok=True)
+        return final_path
+
+    if conversion == "vtt":
+        final_path = unique_path(out_dir / dedup_name(base_name, lang, "srt", tid, used_names))
+        try:
+            vtt_to_srt(raw_path, final_path)
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            final_path = unique_path(out_dir / dedup_name(base_name, lang, "vtt", tid, used_names))
+            raw_path.replace(final_path)
         return final_path
 
     if conversion == "pgs":
@@ -163,7 +254,7 @@ def extract_subtitle_track(mkv_path: str, track: dict, out_dir: Path, base_name:
                 raw_path.unlink(missing_ok=True)
                 return final_path
             except Exception:
-                pass  # OCR failed - fall through to raw bitmap below
+                pass  # OCR failed - fall through to raw bitmap
         final_path = unique_path(out_dir / dedup_name(base_name, lang, "sup", tid, used_names))
         raw_path.replace(final_path)
         return final_path
@@ -223,6 +314,8 @@ class DeleteWorker(QThread):
 
 
 class SeasonWorker(QThread):
+    """Processes episodes in parallel using a thread pool (mkvmerge/mkvextract are
+    external processes, so running several at once scales nicely with CPU cores)."""
     progress = Signal(int, int)
     log = Signal(str)
     finished_ok = Signal(int, list)
@@ -230,6 +323,24 @@ class SeasonWorker(QThread):
     def __init__(self, season_folders: list):
         super().__init__()
         self.season_folders = season_folders
+
+    def _process_episode(self, mkv_path: Path, out_dir: Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_mkv = out_dir / mkv_path.name
+        try:
+            tracks = get_subtitle_tracks(str(mkv_path))
+            remux_without_subtitles(str(mkv_path), out_mkv)
+            used_names = set()
+            for t in tracks:
+                try:
+                    extract_subtitle_track(str(mkv_path), t, out_dir, mkv_path.stem, used_names)
+                except Exception as e:
+                    self.log.emit(f"   subtitle extract failed for {mkv_path.name} (track {t['id']}): {e}")
+            return True, ""
+        except subprocess.CalledProcessError as e:
+            return False, e.stderr.strip()
+        except Exception as e:
+            return False, str(e)
 
     def run(self):
         jobs = []
@@ -245,30 +356,29 @@ class SeasonWorker(QThread):
             self.finished_ok.emit(0, [])
             return
 
-        processed, failed = 0, []
-        for i, (mkv_path, out_dir) in enumerate(jobs, 1):
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_mkv = out_dir / mkv_path.name
-            self.log.emit(f"Processing {mkv_path.name}")
-            try:
-                tracks = get_subtitle_tracks(str(mkv_path))
-                remux_without_subtitles(str(mkv_path), out_mkv)
-                used_names = set()
-                for t in tracks:
-                    try:
-                        extract_subtitle_track(str(mkv_path), t, out_dir, mkv_path.stem, used_names)
-                    except Exception as e:
-                        self.log.emit(f"   subtitle extract failed (track {t['id']}): {e}")
-                processed += 1
-                self.log.emit(f"   done -> {out_mkv}")
-            except subprocess.CalledProcessError as e:
-                msg = e.stderr.strip()
-                failed.append(f"{mkv_path.name}: {msg}")
-                self.log.emit(f"   failed: {msg}")
-            except Exception as e:
-                failed.append(f"{mkv_path.name}: {e}")
-                self.log.emit(f"   failed: {e}")
-            self.progress.emit(i, total)
+        processed, failed, done_count = 0, [], 0
+        max_workers = max(1, int(CONFIG.get("max_workers", 4)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(self._process_episode, mkv_path, out_dir): mkv_path
+                for mkv_path, out_dir in jobs
+            }
+            for future in as_completed(future_map):
+                mkv_path = future_map[future]
+                done_count += 1
+                try:
+                    ok, msg = future.result()
+                    if ok:
+                        processed += 1
+                        self.log.emit(f"[{done_count}/{total}] done: {mkv_path.name}")
+                    else:
+                        failed.append(f"{mkv_path.name}: {msg}")
+                        self.log.emit(f"[{done_count}/{total}] failed: {mkv_path.name} - {msg}")
+                except Exception as e:
+                    failed.append(f"{mkv_path.name}: {e}")
+                    self.log.emit(f"[{done_count}/{total}] failed: {mkv_path.name} - {e}")
+                self.progress.emit(done_count, total)
 
         self.finished_ok.emit(processed, failed)
 
@@ -289,7 +399,7 @@ class SingleFileInterface(QWidget):
         root.setSpacing(14)
 
         top = QHBoxLayout()
-        self.open_btn = PrimaryPushButton("Open MKV")
+        self.open_btn = PrimaryPushButton(FIF.VIDEO, "Open MKV")
         self.open_btn.clicked.connect(self.open_file)
         self.file_label = BodyLabel("No file loaded")
         top.addWidget(self.open_btn)
@@ -307,10 +417,10 @@ class SingleFileInterface(QWidget):
         root.addWidget(self.table, 1)
 
         btns = QHBoxLayout()
-        self.extract_sel_btn = PushButton("Extract Selected")
-        self.extract_all_btn = PushButton("Extract All")
-        self.delete_sel_btn = PushButton("Delete Selected")
-        self.delete_all_btn = PushButton("Delete All")
+        self.extract_sel_btn = PushButton(FIF.DOWNLOAD, "Extract Selected")
+        self.extract_all_btn = PushButton(FIF.DOWNLOAD, "Extract All")
+        self.delete_sel_btn = PushButton(FIF.DELETE, "Delete Selected")
+        self.delete_all_btn = PushButton(FIF.DELETE, "Delete All")
         for b in (self.extract_sel_btn, self.extract_all_btn, self.delete_sel_btn, self.delete_all_btn):
             btns.addWidget(b)
         btns.addStretch()
@@ -342,7 +452,7 @@ class SingleFileInterface(QWidget):
         try:
             self.tracks = get_subtitle_tracks(self.mkv_path)
         except FileNotFoundError:
-            self.notify_error(f"mkvmerge.exe not found at:\n{MKVMERGE}")
+            self.notify_error(f"mkvmerge.exe not found at:\n{CONFIG['mkvmerge_path']}\n\nSet the correct path in the Settings tab.")
             return
         except subprocess.CalledProcessError as e:
             self.notify_error(e.stderr)
@@ -413,7 +523,7 @@ class SingleFileInterface(QWidget):
         base = Path(self.mkv_path).stem
         out_path = unique_path(SCRIPT_DIR / f"{base}.nosubs.mkv")
 
-        cmd = [MKVMERGE, "-o", str(out_path)]
+        cmd = [CONFIG["mkvmerge_path"], "-o", str(out_path)]
         cmd += ["-s", ",".join(keep_ids)] if keep_ids else ["-S"]
         cmd.append(self.mkv_path)
 
@@ -460,13 +570,14 @@ class SeasonInterface(QWidget):
 
         root.addWidget(BodyLabel(
             "Add one or more season folders. Each gets mirrored into a sibling "
-            "'<name>-Subripped' folder with subtitle-free mkvs and matching .srt files."
+            "'<name>-Subripped' folder with subtitle-free mkvs and matching .srt files.\n"
+            f"Episodes process in parallel ({CONFIG.get('max_workers', 4)} at a time — change in Settings)."
         ))
 
         top = QHBoxLayout()
-        self.add_btn = PrimaryPushButton("Add Season Folder")
+        self.add_btn = PrimaryPushButton(FIF.FOLDER_ADD, "Add Season Folder")
         self.add_btn.clicked.connect(self.add_folder)
-        self.clear_btn = PushButton("Clear Queue")
+        self.clear_btn = PushButton(FIF.DELETE, "Clear Queue")
         self.clear_btn.clicked.connect(self.clear_queue)
         top.addWidget(self.add_btn)
         top.addWidget(self.clear_btn)
@@ -477,7 +588,7 @@ class SeasonInterface(QWidget):
         self.queue_list.setMaximumHeight(120)
         root.addWidget(self.queue_list)
 
-        self.start_btn = PrimaryPushButton("Start Processing")
+        self.start_btn = PrimaryPushButton(FIF.PLAY, "Start Processing")
         self.start_btn.clicked.connect(self.start_processing)
         root.addWidget(self.start_btn)
 
@@ -537,13 +648,107 @@ class SeasonInterface(QWidget):
                             parent=self, position=InfoBarPosition.TOP, duration=4000)
 
 
+# ---------- settings tab ----------
+
+class SettingsInterface(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._build_ui()
+        self._load_into_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(18)
+
+        root.addWidget(TitleLabel("Settings"))
+
+        # theme_row = QHBoxLayout()
+        # theme_row.addWidget(BodyLabel("App theme"))
+        # self.theme_combo = ComboBox(self)
+        # self.theme_combo.addItems(["Light", "Dark", "Auto"])
+        # self.theme_combo.currentTextChanged.connect(self.on_theme_changed)
+        # theme_row.addStretch()
+        # theme_row.addWidget(self.theme_combo)
+        # root.addLayout(theme_row)
+
+        self.mkvmerge_edit = self._path_row(root, "mkvmerge.exe path", self.browse_mkvmerge)
+        self.mkvextract_edit = self._path_row(root, "mkvextract.exe path", self.browse_mkvextract)
+        self.tesseract_edit = self._path_row(root, "Tesseract-OCR folder", self.browse_tesseract)
+
+        workers_row = QHBoxLayout()
+        workers_row.addWidget(BodyLabel("Parallel jobs (season processing)"))
+        self.workers_spin = SpinBox(self)
+        self.workers_spin.setRange(1, 16)
+        workers_row.addStretch()
+        workers_row.addWidget(self.workers_spin)
+        root.addLayout(workers_row)
+
+        root.addStretch()
+
+        save_row = QHBoxLayout()
+        self.save_btn = PrimaryPushButton(FIF.SAVE, "Save Settings")
+        self.save_btn.clicked.connect(self.save_all)
+        save_row.addWidget(self.save_btn)
+        save_row.addStretch()
+        root.addLayout(save_row)
+
+    def _path_row(self, root, label_text, browse_fn):
+        row = QHBoxLayout()
+        row.addWidget(BodyLabel(label_text))
+        edit = LineEdit(self)
+        edit.setMinimumWidth(380)
+        browse_btn = PushButton(FIF.FOLDER, "Browse")
+        browse_btn.clicked.connect(lambda: browse_fn(edit))
+        row.addWidget(edit, 1)
+        row.addWidget(browse_btn)
+        root.addLayout(row)
+        return edit
+
+    def browse_mkvmerge(self, edit):
+        path, _ = QFileDialog.getOpenFileName(self, "Select mkvmerge.exe", "", "Executable (*.exe)")
+        if path:
+            edit.setText(path)
+
+    def browse_mkvextract(self, edit):
+        path, _ = QFileDialog.getOpenFileName(self, "Select mkvextract.exe", "", "Executable (*.exe)")
+        if path:
+            edit.setText(path)
+
+    def browse_tesseract(self, edit):
+        path = QFileDialog.getExistingDirectory(self, "Select Tesseract-OCR folder")
+        if path:
+            edit.setText(path)
+
+    def _load_into_ui(self):
+        # self.theme_combo.setCurrentText(CONFIG.get("theme", "auto").capitalize())
+        self.mkvmerge_edit.setText(CONFIG.get("mkvmerge_path", ""))
+        self.mkvextract_edit.setText(CONFIG.get("mkvextract_path", ""))
+        self.tesseract_edit.setText(CONFIG.get("tesseract_dir", ""))
+        self.workers_spin.setValue(int(CONFIG.get("max_workers", 4)))
+
+    def on_theme_changed(self, text):
+        CONFIG["theme"] = text.lower()
+        apply_theme(text.lower())
+        save_config(CONFIG)
+
+    def save_all(self):
+        CONFIG["mkvmerge_path"] = self.mkvmerge_edit.text().strip()
+        CONFIG["mkvextract_path"] = self.mkvextract_edit.text().strip()
+        CONFIG["tesseract_dir"] = self.tesseract_edit.text().strip()
+        CONFIG["max_workers"] = self.workers_spin.value()
+        apply_tesseract_path()
+        save_config(CONFIG)
+        InfoBar.success("Saved", "Settings saved.", parent=self, position=InfoBarPosition.TOP, duration=3000)
+
+
 # ---------- main window ----------
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MKV Subtitle Manager")
-        self.resize(950, 680)
+        self.resize(950, 700)
         self._build_ui()
 
     def _build_ui(self):
@@ -558,9 +763,11 @@ class MainWindow(QWidget):
 
         self.single_iface = SingleFileInterface()
         self.season_iface = SeasonInterface()
+        self.settings_iface = SettingsInterface()
 
-        self.add_sub_interface(self.single_iface, "single", "Single File")
-        self.add_sub_interface(self.season_iface, "season", "Season Processing")
+        self.add_sub_interface(self.single_iface, "single", "Single File", FIF.VIDEO)
+        self.add_sub_interface(self.season_iface, "season", "Season Processing", FIF.FOLDER)
+        self.add_sub_interface(self.settings_iface, "settings", "Settings", FIF.SETTING)
 
         self.stacked.currentChanged.connect(self.on_index_changed)
         self.stacked.setCurrentWidget(self.single_iface)
@@ -569,10 +776,10 @@ class MainWindow(QWidget):
         root.addWidget(self.pivot)
         root.addWidget(self.stacked, 1)
 
-    def add_sub_interface(self, widget, key, text):
+    def add_sub_interface(self, widget, key, text, icon=None):
         widget.setObjectName(key)
         self.stacked.addWidget(widget)
-        self.pivot.addItem(routeKey=key, text=text,
+        self.pivot.addItem(routeKey=key, text=text, icon=icon,
                            onClick=lambda: self.stacked.setCurrentWidget(widget))
 
     def on_index_changed(self, index):
@@ -581,8 +788,8 @@ class MainWindow(QWidget):
 
 
 if __name__ == "__main__":
-    setTheme(Theme.AUTO)
     app = QApplication(sys.argv)
+    apply_theme(CONFIG.get("theme", "auto"))
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
